@@ -75,9 +75,16 @@ def bind_layerwise_keys(
 
 
 def extract_layout_config(extra_config: dict[str, Any]) -> dict[str, Any] | None:
-    """Block-key transfer does not opt into GVA-backed physical reuse."""
-    del extra_config
-    return None
+    """Opt the block-key plane into cross-layer physical buffer reuse.
+
+    Every layer save is published synchronously and only then is that layer's
+    save-finished event set, so a shared buffer is safe to overwrite once the
+    event of its previous owner fires. Layer reuse therefore needs no extra
+    completion gate on this data plane.
+    """
+    if not extra_config.get("use_layerwise", False):
+        return None
+    return extra_config
 
 
 def make_block_key(

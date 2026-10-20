@@ -265,7 +265,7 @@ class TestBlockKeyLayerwiseReuse:
 
         assert scheduler.use_block_key_layerwise
         assert scheduler.layerwise_offload is False
-        assert scheduler._lw_block_hit_cache is not None
+        # v0.30.0 has no block-hit lookup cache (main-only optimization).
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_reuse_follows_backend_opt_in(self, mock_client_cls):
