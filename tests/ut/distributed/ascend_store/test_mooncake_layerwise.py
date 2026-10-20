@@ -251,6 +251,33 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertEqual(request.save_key_block_offset, 1)
         self.assertEqual(request.save_block_keys, ["model@6831@0"])
 
+    def test_partial_tail_key_is_scoped_by_end_token(self):
+        """Each chunk's tail must publish under its own key.
+
+        A single per-request tail key makes the second chunk's publish collide
+        with the first chunk's readable object, so the newer tail is dropped
+        while the older bytes stay loadable under the newer block index.
+        """
+        worker = self._make_worker()
+        worker.m_store.batch_put_start.side_effect = lambda keys, sizes: [0] * len(keys)
+        keys = []
+        for end_token in (48, 80):
+            request = ReqMeta(
+                "r1",
+                token_len_chunk=end_token,
+                save_start_token=0,
+                save_end_token=end_token,
+                block_ids=list(range(end_token // 16)),
+                block_hashes=[b"h0", b"h1", b"h2", b"h3", b"h4"][: end_token // 16],
+                can_save=True,
+                target_token_len=end_token,
+                partial_block_index=end_token // 16 - 1,
+            )
+            worker._prepare_layerwise_put_session(request)
+            keys.append(request.save_last_block_key)
+
+        self.assertEqual(keys, ["model@r1@48_lastblock@0", "model@r1@80_lastblock@0"])
+
     def test_full_remote_hit_loads_last_block_even_when_vllm_keeps_one_token(self):
         worker = self._make_worker()
         request = ReqMeta(
@@ -306,10 +333,10 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
 
         self.assertEqual(
             request.load_block_keys,
-            ["model@6830@0", "model@r1_lastblock@0"],
+            ["model@6830@0", "model@r1@32_lastblock@0"],
         )
         self.assertIsNone(request.load_last_block_key)
-        self.assertEqual(slots[-1], ("model@r1_lastblock@0", 11, 1))
+        self.assertEqual(slots[-1], ("model@r1@32_lastblock@0", 11, 1))
 
     def test_reused_layer_reloads_full_prefix_for_block_key_plane(self):
         """A reused layer must reload the whole cached prefix from the pool.

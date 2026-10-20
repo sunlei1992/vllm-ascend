@@ -2536,7 +2536,13 @@ class KVPoolWorker:
             key_slots.append((key, block_index - start_block, block_index))
 
         if request.partial_block_index is not None:
-            request.save_last_block_key = self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock")
+            # Scope the tail snapshot by its end position. A later chunk writes
+            # a different tail for the same request, and a single per-request
+            # key would leave the earlier bytes readable under the new block
+            # index once the store rejects the duplicate publish.
+            request.save_last_block_key = self._make_mooncake_layerwise_key(
+                f"{request.req_id}@{request.target_token_len}_lastblock"
+            )
             key_slots.append((request.save_last_block_key, None, request.partial_block_index))
 
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
@@ -2606,7 +2612,7 @@ class KVPoolWorker:
             if needs_last_block and 0 <= partial_block_index < len(request.block_ids):
                 current_entries.append(
                     (
-                        self._make_mooncake_layerwise_key(f"{request.req_id}_lastblock"),
+                        self._make_mooncake_layerwise_key(f"{request.req_id}@{cached_tokens}_lastblock"),
                         partial_block_index,
                     )
                 )
