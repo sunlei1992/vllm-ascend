@@ -245,25 +245,32 @@ class KVPoolScheduler:
             self.put_step = 1
         self.num_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.layerwise_offload = False
-        if self.use_layerwise_transfer:
-            extra_config = get_layerwise_reuse_config(vllm_config.kv_transfer_config)
-            if kv_cache_config is not None and extra_config is not None:
-                reuse_layout = build_layerwise_reuse_layout(
-                    get_layerwise_kv_cache_specs(kv_cache_config),
+        reuse_config = self._layerwise_reuse_config(vllm_config)
+        if kv_cache_config is not None and reuse_config is not None:
+            reuse_layout = build_layerwise_reuse_layout(
+                get_layerwise_kv_cache_specs(kv_cache_config),
+                self.num_layers,
+                reuse_config,
+            )
+            if reuse_layout.layer_cache_specs:
+                self.num_layers = max(
                     self.num_layers,
-                    extra_config,
+                    max(reuse_layout.layer_cache_specs) + 1,
                 )
-                if reuse_layout.layer_cache_specs:
-                    self.num_layers = max(
-                        self.num_layers,
-                        max(reuse_layout.layer_cache_specs) + 1,
-                    )
-                self.layerwise_offload = reuse_layout.has_layer_reuse
-            else:
-                self.layerwise_offload = build_layerwise_cache_layout(
-                    self.num_layers,
-                    vllm_config.kv_transfer_config.kv_connector_extra_config,
-                ).has_layer_reuse
+            self.layerwise_offload = reuse_layout.has_layer_reuse
+            if self.layerwise_offload and self.block_key_hybrid:
+                # The worker applies the same restriction before registering
+                # buffers; fail here so the scheduler never plans a layout the
+                # block-key plane cannot fence.
+                raise NotImplementedError(
+                    "Layerwise KV cache reuse on the block-key transfer plane does not support "
+                    "hybrid or recurrent KV layouts yet."
+                )
+        elif self.use_layerwise_transfer:
+            self.layerwise_offload = build_layerwise_cache_layout(
+                self.num_layers,
+                vllm_config.kv_transfer_config.kv_connector_extra_config,
+            ).has_layer_reuse
         self.model_name = model_config.model.split("/")[-1]
 
         self.client: LookupKeyClient | None = None
@@ -285,6 +292,16 @@ class KVPoolScheduler:
         self._lw_hit_cache_ttl = 30.0
         self._lw_hit_cache_hit_ttl = 0.5
         self._lw_hit_cache_max = 200_000
+
+    def _layerwise_reuse_config(self, vllm_config: VllmConfig) -> dict[str, Any] | None:
+        """Extra config that opts this transfer plane into buffer reuse.
+
+        A block-key backend only opts in through its protocol, which is the
+        same gate the worker applies before planning shared buffers.
+        """
+        if not self.use_layerwise:
+            return None
+        return get_layerwise_reuse_config(vllm_config.kv_transfer_config)
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)

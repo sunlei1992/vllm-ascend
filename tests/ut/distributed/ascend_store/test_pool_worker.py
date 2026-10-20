@@ -258,6 +258,84 @@ class TestPCPPoolWorker(unittest.TestCase):
                     self.doCleanups()
 
 
+class TestBlockKeyLayerwiseReuse(unittest.TestCase):
+    """The block-key (Mooncake) plane only plans reuse after backend opt-in."""
+
+    @staticmethod
+    def _kv_cache_config(num_groups=1, num_layers=4):
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
+        groups = []
+        for group_id in range(num_groups):
+            group_names = [f"model.layers.{index}.attn" for index in range(group_id, num_layers, num_groups)]
+            groups.append(
+                KVCacheGroupSpec(
+                    layer_names=group_names,
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs=dict.fromkeys(group_names, spec),
+                    ),
+                )
+            )
+        return SimpleNamespace(
+            num_blocks=2,
+            prefix_cache_retention_interval=0,
+            kv_cache_groups=groups,
+        )
+
+    def test_reuse_stays_disabled_without_backend_opt_in(self):
+        worker = make_worker(
+            self,
+            num_layers=4,
+            num_hidden_layers=4,
+            use_layerwise=True,
+            extra_config={"backend": "mooncake", "layerwise_num_shared_buffers": 1},
+            kv_cache_config=self._kv_cache_config(),
+        )
+
+        self.assertTrue(worker.use_block_key_layerwise)
+        self.assertFalse(worker.layerwise_offload)
+        self.assertEqual(worker.prefetch_layer_map, {})
+        self.assertEqual(worker.num_prefetch_layers, 2)
+
+    def test_reuse_follows_backend_opt_in(self):
+        reuse_config = {"backend": "mooncake", "layerwise_num_shared_buffers": 1}
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_layerwise_reuse_config",
+            return_value=reuse_config,
+        ):
+            worker = make_worker(
+                self,
+                num_layers=4,
+                num_hidden_layers=4,
+                use_layerwise=True,
+                extra_config={"backend": "mooncake", "layerwise_num_shared_buffers": 1},
+                kv_cache_config=self._kv_cache_config(),
+            )
+
+        self.assertTrue(worker.layerwise_offload)
+        self.assertEqual(worker.independent_layers, [0])
+        self.assertEqual(worker.prefetch_layer_map, {2: 1, 3: 2})
+        self.assertEqual(worker.num_prefetch_layers, 1)
+
+    def test_multi_group_reuse_is_rejected(self):
+        reuse_config = {"backend": "mooncake", "layerwise_num_shared_buffers": 1}
+        with (
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker.get_layerwise_reuse_config",
+                return_value=reuse_config,
+            ),
+            self.assertRaises(NotImplementedError),
+        ):
+            make_worker(
+                self,
+                num_layers=4,
+                num_hidden_layers=4,
+                use_layerwise=True,
+                extra_config={"backend": "mooncake", "layerwise_num_shared_buffers": 1},
+                kv_cache_config=self._kv_cache_config(num_groups=2),
+            )
+
+
 class TestLayerwiseAttentionSave(unittest.TestCase):
     def make_worker(self):
         plan = SimpleNamespace(

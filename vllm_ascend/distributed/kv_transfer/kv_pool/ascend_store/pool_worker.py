@@ -73,6 +73,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_la
     build_layerwise_reuse_layout,
     get_layerwise_kv_cache_specs,
     get_layerwise_physical_layer_index,
+    get_layerwise_reuse_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     AscendConnectorMetadata,
@@ -542,12 +543,14 @@ class KVPoolWorker:
                 "num_hidden_layers",
                 self.num_layers,
             )
-            if self.use_layerwise_transfer:
+            reuse_config = self._layerwise_reuse_config()
+            if reuse_config is not None:
                 self._layerwise_reuse_layout = build_layerwise_reuse_layout(
                     target_specs,
                     base_layers,
-                    self._extra_config,
+                    reuse_config,
                 )
+                self._validate_layerwise_reuse_layout(self._layerwise_reuse_layout)
                 if (
                     draft_names
                     and not self._layerwise_reuse_layout.has_layer_reuse
@@ -619,8 +622,14 @@ class KVPoolWorker:
         self.layerwise_offload = False
         self.independent_layers: list[int] = []
         self.prefetch_layer_map: dict[int, int] = {}
-        if self.use_layerwise_transfer:
-            if self._layerwise_reuse_layout is None:
+        reuse_layout = self._layerwise_reuse_layout
+        block_key_plane = getattr(self, "use_block_key_layerwise", False)
+        if block_key_plane and reuse_layout is not None and not reuse_layout.has_layer_reuse:
+            # A block-key backend that opts in without a reusable layout keeps
+            # its own prefetch default instead of the GVA fallback below.
+            reuse_layout = None
+        if self.use_layerwise_transfer or reuse_layout is not None:
+            if reuse_layout is None:
                 cache_layout = build_layerwise_cache_layout(
                     self.num_layers,
                     self._extra_config,
@@ -630,19 +639,7 @@ class KVPoolWorker:
                 self.prefetch_layer_map = cache_layout.prefetch_layer_map
                 self.num_prefetch_layers = cache_layout.num_prefetch_layers
             else:
-                layout = self._layerwise_reuse_layout
-                stage_globals = sorted(layout.layer_cache_specs)
-                if stage_globals:
-                    self.prefetch_layer_map, self.independent_layers = self._remap_layout_to_stage_local(
-                        layout.prefetch_layer_map,
-                        layout.independent_layers,
-                        stage_globals,
-                    )
-                else:
-                    self.prefetch_layer_map = layout.prefetch_layer_map
-                    self.independent_layers = layout.independent_layers
-                self.layerwise_offload = layout.has_layer_reuse
-                self.num_prefetch_layers = layout.num_prefetch_layers
+                self._apply_layerwise_reuse_layout(reuse_layout)
         else:
             self.num_prefetch_layers = 2
             if self.use_layerwise:
@@ -676,6 +673,45 @@ class KVPoolWorker:
             {global_to_local[layer]: global_to_local[source] for layer, source in prefetch_layer_map.items()},
             [global_to_local[layer] for layer in independent_layers],
         )
+
+    def _layerwise_reuse_config(self) -> dict[str, Any] | None:
+        """Extra config that opts this transfer plane into buffer reuse.
+
+        The GVA (Memcache) plane uses its own extra config, which already *is*
+        the reuse opt-in. The block-key plane additionally needs its backend
+        protocol to promise a per-buffer completion gate, so a store backend
+        that cannot fence shared buffers never computes a reuse plan.
+        """
+        if getattr(self, "use_layerwise_transfer", False):
+            return self._extra_config
+        if getattr(self, "use_block_key_layerwise", False):
+            return get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
+        return None
+
+    def _validate_layerwise_reuse_layout(self, layout: LayerwiseReuseLayout) -> None:
+        """Reject layouts the block-key plane cannot fence yet."""
+        if not (getattr(self, "use_block_key_layerwise", False) and layout.has_layer_reuse):
+            return
+        if self.block_key_hybrid or self.use_mamba:
+            raise NotImplementedError(
+                "Layerwise KV cache reuse on the block-key transfer plane does not support "
+                "hybrid or recurrent KV layouts yet."
+            )
+
+    def _apply_layerwise_reuse_layout(self, layout: LayerwiseReuseLayout) -> None:
+        """Adopt a reuse layout, translated to this stage's local layer indices."""
+        stage_globals = sorted(layout.layer_cache_specs)
+        if stage_globals:
+            self.prefetch_layer_map, self.independent_layers = self._remap_layout_to_stage_local(
+                layout.prefetch_layer_map,
+                layout.independent_layers,
+                stage_globals,
+            )
+        else:
+            self.prefetch_layer_map = layout.prefetch_layer_map
+            self.independent_layers = layout.independent_layers
+        self.layerwise_offload = layout.has_layer_reuse
+        self.num_prefetch_layers = layout.num_prefetch_layers
 
     def _build_group_layer_builders(self) -> list[LayerBatchBuilder]:
         builders = []

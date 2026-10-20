@@ -239,6 +239,68 @@ def test_mooncake_layerwise_accepts_aligned_recurrent_state(num_speculative_bloc
     )
 
 
+class TestBlockKeyLayerwiseReuse:
+    """The scheduler must mirror the worker's per-plane reuse opt-in."""
+
+    @staticmethod
+    def _kv_cache_config(num_layers=4):
+        spec = FullAttentionSpec(block_size=16, num_kv_heads=1, head_size=4, dtype=torch.int8)
+        names = [f"model.layers.{index}.attn" for index in range(num_layers)]
+        return SimpleNamespace(
+            num_blocks=2,
+            prefix_cache_retention_interval=0,
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    layer_names=names,
+                    kv_cache_spec=UniformTypeKVCacheSpecs(
+                        block_size=16,
+                        kv_cache_specs=dict.fromkeys(names, spec),
+                    ),
+                )
+            ],
+        )
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_reuse_stays_disabled_without_backend_opt_in(self, mock_client_cls):
+        config = make_config(extra_config={"backend": "mooncake", "layerwise_num_shared_buffers": 1})
+        config.model_config.get_num_layers.return_value = 4
+
+        scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=self._kv_cache_config())
+
+        assert scheduler.use_block_key_layerwise
+        assert scheduler.layerwise_offload is False
+        assert scheduler._lw_block_hit_cache is not None
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_reuse_follows_backend_opt_in(self, mock_client_cls):
+        config = make_config(extra_config={"backend": "mooncake", "layerwise_num_shared_buffers": 1})
+        config.model_config.get_num_layers.return_value = 4
+        reuse_config = {"backend": "mooncake", "layerwise_num_shared_buffers": 1}
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.get_layerwise_reuse_config",
+            return_value=reuse_config,
+        ):
+            scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=self._kv_cache_config())
+
+        assert scheduler.layerwise_offload is True
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_gva_reuse_is_unchanged(self, mock_client_cls):
+        config = make_config(extra_config={"backend": "memcache", "layerwise_num_shared_buffers": 1})
+        config.model_config.get_num_layers.return_value = 4
+        reuse_config = {"backend": "memcache", "layerwise_num_shared_buffers": 1}
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.get_layerwise_reuse_config",
+            return_value=reuse_config,
+        ):
+            scheduler = KVPoolScheduler(config, use_layerwise=True, kv_cache_config=self._kv_cache_config())
+
+        assert scheduler.use_layerwise_transfer
+        assert scheduler.layerwise_offload is True
+
+
 class TestGetZmqRpcPathLookup(unittest.TestCase):
     def test_rpc_path(self):
         cases = [({}, 0, 0), ({"lookup_rpc_port": 5555}, 1, 5555), ({"mooncake_rpc_port": 6666}, 0, 6666)]
