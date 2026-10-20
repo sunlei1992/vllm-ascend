@@ -304,7 +304,11 @@ sender thread remains alive, Prefill may continue waiting.
   keep-device-cache and overlap paths. Config validation checks the installed
   build's device metadata before offload allocation; it does not require NPU
   initialization or a runtime SoC query.
-- Layerwise shared-buffer offload requires the Memcache backend and eager mode.
+- Layerwise shared-buffer offload requires eager mode and either the Memcache
+  (GVA) or Mooncake (block-key) backend. Both planes fence a shared buffer
+  before overwriting it: GVA on the previous owner's write-finished event, the
+  block-key plane on the synchronous publish of the previous owner's save.
+  Hybrid, recurrent and multi-group KV layouts are rejected before allocation.
 - Sparse Decode Offload supports Model Runner V1 and V2 with an SFA/MLA
   sparse-attention model. The main KV cache must use BF16; packed main caches
   (C8 or TQ4) are rejected. LIC8 quantization is supported separately for the
@@ -314,7 +318,9 @@ sender thread remains alive, Prefill may continue waiting.
 - Joint deployment requires Prefill TP to be greater than or equal to, and
   divisible by, Decode TP.
 - MemFabric is the only supported Remote D2H transfer backend.
-- Layerwise buffer reuse cannot currently be combined with
-  `MooncakeLayerwiseConnector` because it does not provide a per-buffer transfer
-  completion gate. Support is planned in a follow-up update.
+- `AscendStoreConnector` plans shared-buffer reuse on both the Memcache (GVA)
+  and Mooncake (block-key) planes. `MooncakeLayerwiseConnector` and
+  `SfaRemoteD2HConnector` do not plan reuse themselves: inside
+  `MultiConnector` they contribute the per-physical-slot release gate that an
+  `AscendStoreConnector` reuse plan needs once Decode has consumed the buffer.
 - Connector-level data-read retry is not implemented.

@@ -70,7 +70,9 @@ There is no extra work to do on decode nodes.
 
 Requirements and limitations:
 
-- Shared-buffer Layerwise Prefill Offload requires Memcache and eager mode.
+- Shared-buffer Layerwise Prefill Offload requires eager mode and either the
+  Memcache backend (GVA plane) or the Mooncake backend (block-key plane).
+  Hybrid, recurrent and multi-group KV layouts are not supported yet.
 - `SfaRemoteD2HConnector` is the only supported connector to be used with prefill offload and decode offload.
 
 For a combined deployment, Prefill TP must be greater than or equal to Decode

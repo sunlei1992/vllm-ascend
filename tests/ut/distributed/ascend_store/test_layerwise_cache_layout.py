@@ -42,14 +42,14 @@ def _make_full_attention_spec(
     )
 
 
-def _make_vllm_config(num_layers: int, num_shared_buffers: int):
+def _make_vllm_config(num_layers: int, num_shared_buffers: int, backend: str = "memcache"):
     model_config = MagicMock()
     model_config.get_num_layers.return_value = num_layers
     return SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             kv_connector="AscendStoreConnector",
             kv_connector_extra_config={
-                "backend": "memcache",
+                "backend": backend,
                 "use_layerwise": True,
                 "layerwise_num_shared_buffers": num_shared_buffers,
             },
@@ -114,6 +114,33 @@ def test_base_layers_are_merged_into_shared_slots():
         ["model.layers.0.self_attn"],
         ["model.layers.1.self_attn", "model.layers.3.self_attn", "model.layers.5.self_attn"],
         ["model.layers.2.self_attn", "model.layers.4.self_attn"],
+    ]
+
+
+def test_block_key_backend_merges_shared_slots():
+    """A block-key backend that opts in gets the same merged descriptors."""
+    original_tensors = [_make_kv_cache_tensor(32, [f"model.layers.{layer}.self_attn"]) for layer in range(4)]
+    layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
+    spec = _make_full_attention_spec()
+    kv_cache_config = SimpleNamespace(
+        num_blocks=1,
+        kv_cache_tensors=original_tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=layer_names,
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=2,
+                    kv_cache_specs=dict.fromkeys(layer_names, spec),
+                ),
+            )
+        ],
+    )
+
+    apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(4, 1, backend="mooncake"))
+
+    assert [get_kv_cache_tensor_layers(tensor) for tensor in kv_cache_config.kv_cache_tensors] == [
+        ["model.layers.0.self_attn"],
+        ["model.layers.1.self_attn", "model.layers.2.self_attn", "model.layers.3.self_attn"],
     ]
 
 
@@ -198,7 +225,7 @@ def test_reuse_config_is_scoped_to_layerwise_protocol_connector():
             ]
         },
     )
-    unsupported = SimpleNamespace(
+    block_key_opted_in = SimpleNamespace(
         kv_connector="AscendStoreConnector",
         kv_connector_extra_config={"backend": "mooncake", "use_layerwise": True},
     )
@@ -217,7 +244,7 @@ def test_reuse_config_is_scoped_to_layerwise_protocol_connector():
             kv_connector_extra_config=ascend_store_config,
         )
         assert get_layerwise_reuse_config(direct_config) is ascend_store_config
-    assert get_layerwise_reuse_config(unsupported) is None
+    assert get_layerwise_reuse_config(block_key_opted_in) is block_key_opted_in.kv_connector_extra_config
     assert get_layerwise_reuse_config(not_opted_in) is None
 
 
