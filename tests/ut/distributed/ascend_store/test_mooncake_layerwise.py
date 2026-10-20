@@ -311,6 +311,86 @@ class TestMooncakeWorkerSessionPreparation(unittest.TestCase):
         self.assertIsNone(request.load_last_block_key)
         self.assertEqual(slots[-1], ("model@r1_lastblock@0", 11, 1))
 
+    def test_reused_layer_reloads_full_prefix_for_block_key_plane(self):
+        """A reused layer must reload the whole cached prefix from the pool.
+
+        Layers sharing a physical KV buffer overwrite each other, so unlike an
+        independent layer a reused layer cannot keep the HBM-resident suffix:
+        the pool copy is the only source for the prefix. The independent layer
+        must keep loading only the part that is not already resident.
+        """
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.layerwise_offload = True
+        worker.independent_layers = [0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"h0", b"h1"],
+            load_spec=LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=True, token_len=32),
+        )
+
+        worker._prepare_layerwise_get_session(request)
+        worker.layer_load_tasks = [[], []]
+        worker._process_load_for_layer_batch([request], 0)
+        worker._process_load_for_layer_batch([request], 1)
+
+        self.assertEqual(request.load_block_keys, ["model@6830@0", "model@6831@0"])
+        independent = worker.layer_load_tasks[0][0].block_ranges[0]
+        reused = worker.layer_load_tasks[1][0].block_ranges[0]
+        self.assertEqual((independent.start_block, independent.end_block), (1, 2))
+        self.assertEqual((reused.start_block, reused.end_block), (0, 2))
+
+    def test_independent_layer_skips_fully_resident_prefix_for_block_key_plane(self):
+        """The independent layer must not reload a prefix still in HBM."""
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.layerwise_offload = True
+        worker.independent_layers = [0]
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"h0", b"h1"],
+            load_spec=LoadSpec(vllm_cached_tokens=32, kvpool_cached_tokens=32, can_load=True, token_len=32),
+        )
+
+        worker._prepare_layerwise_get_session(request)
+        worker.layer_load_tasks = [[], []]
+        worker._process_load_for_layer_batch([request], 0)
+        worker._process_load_for_layer_batch([request], 1)
+
+        self.assertEqual(worker.layer_load_tasks[0], [])
+        reused = worker.layer_load_tasks[1][0].block_ranges[0]
+        self.assertEqual((reused.start_block, reused.end_block), (0, 2))
+
+    def test_next_chunk_prefix_still_loads_for_independent_layer(self):
+        """New local blocks hold no KV, so the tracked prefix must be restored."""
+        worker = self._make_worker()
+        worker.num_layers = 2
+        worker.layerwise_offload = True
+        worker.independent_layers = [0]
+        worker._layerwise_session_tracker.register_put_keys("r1", [("model@6830@0", 0)])
+        worker._layerwise_session_tracker.commit_put_keys(["model@6830@0"])
+        request = ReqMeta(
+            "r1",
+            token_len_chunk=32,
+            block_ids=[10, 11],
+            block_hashes=[b"h0", b"h1"],
+            load_spec=None,
+            is_last_chunk=False,
+        )
+
+        worker._prepare_layerwise_get_session(request)
+        worker.layer_load_tasks = [[], []]
+        worker._process_load_for_layer_batch([request], 0)
+        worker._process_load_for_layer_batch([request], 1)
+
+        for layer_id in (0, 1):
+            block_range = worker.layer_load_tasks[layer_id][0].block_ranges[0]
+            self.assertEqual((block_range.start_block, block_range.end_block), (0, 1))
+
 
 class TestLayerwiseSessionTracker(unittest.TestCase):
     def test_commit_promotes_shared_put_key_to_every_request_owner(self):

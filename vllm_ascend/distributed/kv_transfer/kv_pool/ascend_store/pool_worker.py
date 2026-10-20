@@ -1607,11 +1607,24 @@ class KVPoolWorker:
                 populated_slots = [index for index, key in enumerate(request.load_block_keys) if key is not None]
                 if not populated_slots:
                     continue
+                start_block = min(populated_slots)
+                end_block = max(populated_slots) + 1
+                if self.layerwise_offload and layer_id not in self.independent_layers:
+                    # Shared buffers were overwritten by an earlier owner, so
+                    # the pool copy is the only source for the prefix.
+                    start_block = 0
+                elif request.load_spec is not None and request.load_spec.can_load:
+                    # Independent layers keep their HBM-resident prefix and
+                    # load only the part that is not resident yet.
+                    resident_blocks = request.load_spec.vllm_cached_tokens // block_size
+                    start_block = min(end_block, max(start_block, resident_blocks))
+                if start_block >= end_block:
+                    continue
                 request_block_ranges.append(
                     LayerBlockRange(
                         request=request,
-                        start_block=min(populated_slots),
-                        end_block=max(populated_slots) + 1,
+                        start_block=start_block,
+                        end_block=end_block,
                     )
                 )
                 continue
@@ -2571,7 +2584,11 @@ class KVPoolWorker:
             cached_tokens = load_spec.kvpool_cached_tokens
             if not self.use_eagle and load_spec.kvpool_store_skip_tokens is not None:
                 cached_tokens = load_spec.kvpool_store_skip_tokens
-            start_block = load_spec.vllm_cached_tokens // self.block_size
+            # A reused layer must reload the whole cached prefix: layers that
+            # share a physical buffer overwrite each other, so the HBM copy is
+            # not a source of truth. Independent layers narrow this range back
+            # to their resident prefix in _process_load_for_layer_batch().
+            start_block = 0 if self.layerwise_offload else load_spec.vllm_cached_tokens // self.block_size
             cached_full_blocks = cached_tokens // self.block_size
             group_block_hashes = get_block_hashes(request.block_hashes, self.block_size, self.hash_block_size)
             end_block = min(cached_full_blocks, len(group_block_hashes))
