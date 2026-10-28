@@ -130,6 +130,31 @@ class TestLayerBatchBuilderOffsets(unittest.TestCase):
         np.testing.assert_array_equal(layer_1[2], [530])
 
 
+    def test_indexer_entry_is_packed_after_main_for_every_layer(self):
+        """GLM-5.3 shape: each physical layer has a main MLA page and an indexer page."""
+        database = FakeTokenDatabase()
+        database.set_group_buffers(
+            {0: [10_000, 20_000, 30_000, 40_000]},
+            {0: [8192, 1024, 8192, 1024]},
+            {0: [8192, 1024, 8192, 1024]},
+            group_num_layers={0: 2},
+            group_layer_cache_entry_offsets={0: [0, 2, 4]},
+        )
+        builder = LayerBatchBuilder(database, page_size_bytes=9216, num_layers=2)
+
+        cases = [
+            (0, 10_000 + 5 * 8192, 20_000 + 5 * 1024, [500, 500 + 8192]),
+            (1, 30_000 + 5 * 8192, 40_000 + 5 * 1024, [500 + 9216, 500 + 9216 + 8192]),
+        ]
+        for layer_id, main_addr, indexer_addr, gvas in cases:
+            addr, size, out_gvas = builder._build_transfer_arrays(
+                np.asarray([5]), np.asarray([500]), layer_id
+            )
+            np.testing.assert_array_equal(addr, [main_addr, indexer_addr])
+            np.testing.assert_array_equal(size, [8192, 1024])
+            np.testing.assert_array_equal(out_gvas, gvas)
+
+
 class TestKVTransferThread(unittest.TestCase):
     def _make_thread(self, exists_result=None):
         store = FakeStore(exists_result or [])
