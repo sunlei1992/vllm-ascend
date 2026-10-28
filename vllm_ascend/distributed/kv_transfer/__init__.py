@@ -82,6 +82,13 @@ def register_connector():
         "AscendStoreConnector",
     )
 
+    # LOCAL EXPERIMENT: in-memory AscendStore stand-in for simulated execution.
+    KVConnectorFactory.register_connector(
+        "SimulatedAscendStoreConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.simulated_connector",
+        "SimulatedAscendStoreConnector",
+    )
+
     KVConnectorFactory.register_connector(
         "MooncakeLayerwiseConnector",
         "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector",
