@@ -823,3 +823,45 @@ def test_reuse_rejects_out_of_bounds_generic_indexer_descriptor():
     config.kv_cache_tensors[-1].offset = config.kv_cache_tensors[-1].size - 1
     with pytest.raises(ValueError, match="exceeds its backing allocation"):
         apply_layerwise_kv_cache_plan(config, _make_vllm_config(5, 1))
+
+
+def test_glm53_sfa_indexer_layers_get_reuse():
+    """GLM-5.3 shape: one SFA MLA main spec plus an indexer spec per layer.
+
+    The model keeps both in a single UniformType group (the indexer spec says
+    it shares block ids with the MLA cache), so the reuse planner must pair
+    them per physical layer and still share buffers across layers.
+    """
+    main = AscendMLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=576,
+        dtype=torch.bfloat16,
+    )
+    indexer = AscendSFAIndexerCacheSpec(
+        block_size=2,
+        num_kv_heads=1,
+        max_tp_shards=1,
+        head_size=192,
+        dtype=torch.uint8,
+        scale_dim=4,
+    )
+    layers = 4
+    layer_specs: dict[str, object] = {}
+    for i in range(layers):
+        layer_specs[f"model.layers.{i}.self_attn.attn"] = main
+        layer_specs[f"model.layers.{i}.self_attn.indexer.k_cache"] = indexer
+
+    layout = build_layerwise_reuse_layout(
+        layer_specs,
+        layers,
+        {"layerwise_num_shared_buffers": 1, "layerwise_num_prefetch_layers": 1},
+    )
+
+    assert layout.has_layer_reuse
+    assert len(layout.layer_cache_specs) == layers
+    assert all(specs.indexer is not None for specs in layout.layer_cache_specs.values())
+    assert all(specs.main.layer_name.endswith(".attn") for specs in layout.layer_cache_specs.values())
+    # One independent layer plus one shared slot for the rest.
+    assert len(layout.buffer_slots) == 2
