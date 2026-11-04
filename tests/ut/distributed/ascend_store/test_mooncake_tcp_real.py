@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_pd impor
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.mooncake_tcp_transport import (  # noqa: E402
     connect_mooncake_tcp,
+    connect_mooncake_tcp_session,
 )
 
 
@@ -42,6 +43,30 @@ def test_real_tcp_layer_roundtrip() -> None:
     publisher = LayerwisePublisher(slots=((0,),), transport=transport)
     payload0 = b"rank0" * 1024
     payload1 = b"rank1" * 1024
+    try:
+        publisher.publish(0, key, {0: payload0, 1: payload1})
+        consumer = LayerwiseConsumer(transport=transport, num_shards=2)
+        assert consumer.receive(0, key) == payload0 + payload1
+    finally:
+        transport.release(key)
+
+
+@pytest.mark.skipif(
+    not os.getenv("MOONCAKE_MASTER"),
+    reason="set MOONCAKE_MASTER to run the real Mooncake TCP test",
+)
+def test_real_tcp_session_layer_roundtrip() -> None:
+    key = f"layerwise-session-{os.getpid()}-{time.time_ns()}"
+    transport = connect_mooncake_tcp_session(
+        master_server_addr=os.environ["MOONCAKE_MASTER"],
+        num_shards=2,
+        key_prefix="ut-session",
+        global_segment_size=4 * 1024**3,
+        local_buffer_size=512 * 1024**2,
+    )
+    publisher = LayerwisePublisher(slots=((0,),), transport=transport)
+    payload0 = b"session0" * 1024
+    payload1 = b"session1" * 1024
     try:
         publisher.publish(0, key, {0: payload0, 1: payload1})
         consumer = LayerwiseConsumer(transport=transport, num_shards=2)
