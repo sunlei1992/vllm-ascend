@@ -865,3 +865,48 @@ def test_glm53_sfa_indexer_layers_get_reuse():
     assert all(specs.main.layer_name.endswith(".attn") for specs in layout.layer_cache_specs.values())
     # One independent layer plus one shared slot for the rest.
     assert len(layout.buffer_slots) == 2
+
+
+def test_qwen3_like_layers_alias_to_four_slots():
+    """P0: 28 Qwen3-like layers must become four physical descriptors."""
+    num_layers = 28
+    num_blocks = 8
+    spec = _make_full_attention_spec(num_kv_heads=8, head_size=128)
+    layer_size = num_blocks * spec.page_size_bytes
+    original_tensors = [
+        KVCacheTensor(
+            size=layer_size,
+            layers=[f"model.layers.{layer}.self_attn"],
+            layer_stride=layer_size,
+            block_stride=spec.page_size_bytes,
+            offset=0,
+        )
+        for layer in range(num_layers)
+    ]
+    layer_names = [get_kv_cache_tensor_layers(tensor)[0] for tensor in original_tensors]
+    kv_cache_config = SimpleNamespace(
+        num_blocks=num_blocks,
+        kv_cache_tensors=original_tensors,
+        kv_cache_groups=[
+            SimpleNamespace(
+                layer_names=layer_names,
+                kv_cache_spec=UniformTypeKVCacheSpecs(
+                    block_size=spec.block_size,
+                    kv_cache_specs=dict.fromkeys(layer_names, spec),
+                ),
+            )
+        ],
+    )
+
+    apply_layerwise_kv_cache_plan(kv_cache_config, _make_vllm_config(num_layers, 3))
+
+    tensors = kv_cache_config.kv_cache_tensors
+    assert len(tensors) == 4
+    assert [len(get_kv_cache_tensor_layers(tensor)) for tensor in tensors] == [1, 9, 9, 9]
+    for tensor in tensors:
+        assert tensor.layer_stride == 0
+        assert tensor.block_stride == spec.page_size_bytes
+        assert tensor.size == num_blocks * spec.page_size_bytes
+    covered = [name for tensor in tensors for name in get_kv_cache_tensor_layers(tensor)]
+    assert len(covered) == num_layers
+    assert len(set(covered)) == num_layers
