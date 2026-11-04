@@ -10,8 +10,9 @@ testable before the data plane is connected.
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -19,6 +20,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
 )
 from vllm.logger import init_logger
+
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_pd import (
+    LayerwiseConsumer,
+    LayerwisePDTransport,
+    LayerwisePublisher,
+)
 
 if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -36,6 +43,14 @@ class LayerwisePDRequestMeta:
     request_id: str
     key: str
     num_shards: int = 1
+
+
+class LayerwisePDCodec(Protocol):
+    """Convert a vLLM KV layer to/from per-TP-shard bytes."""
+
+    def encode(self, layer_name: str, kv_layer: Any, key: str) -> Mapping[int, bytes]: ...
+
+    def decode(self, layer_name: str, payload: bytes) -> None: ...
 
 
 @dataclass
@@ -120,18 +135,47 @@ class LayerwisePDConnector(KVConnectorBase_V1):
     # ------------------------------------------------------------------
     # Worker side
     # ------------------------------------------------------------------
+    def attach_layerwise_runtime(
+        self,
+        *,
+        transport: LayerwisePDTransport,
+        slots: tuple[tuple[str, ...], ...],
+        num_shards: int,
+        codec: LayerwisePDCodec,
+    ) -> None:
+        """Attach the real transport/codec to a worker connector.
+
+        The scheduler-side connector does not need this; the worker calls it
+        after the Mooncake store and KV caches are initialized.
+        """
+        if self.role != KVConnectorRole.WORKER:
+            raise RuntimeError("layerwise runtime can only be attached on the worker")
+        self.transport = transport
+        self._publisher = LayerwisePublisher(slots=slots, transport=transport)
+        self._consumer = LayerwiseConsumer(transport=transport, num_shards=num_shards)
+        self._codec = codec
+
+    def set_active_request(self, key: str) -> None:
+        self._active_key = key
+
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         self._worker_layer_names = sorted(kv_caches)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         del forward_context, kwargs
-        if self.transport is None and self.is_consumer:
-            logger.debug("LayerwisePDConnector consumer has no transport attached")
+        if not self.has_connector_metadata():
+            return
+        metadata = self._get_connector_metadata()
+        if isinstance(metadata, LayerwisePDMetadata) and metadata.requests:
+            self._active_key = metadata.requests[0].key
 
     def wait_for_layer_load(self, layer_name: str) -> None:
-        del layer_name
-        if self.transport is None and self.is_consumer:
+        if self.transport is None or self._consumer is None or self._codec is None:
             return
+        if not self.is_consumer or self._active_key is None:
+            return
+        payload = self._consumer.receive(layer_name, self._active_key)
+        self._codec.decode(layer_name, payload)
 
     def save_kv_layer(
         self,
@@ -140,8 +184,13 @@ class LayerwisePDConnector(KVConnectorBase_V1):
         attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
-        del kv_layer, attn_metadata, kwargs
-        if self.transport is None and self.is_producer:
+        del attn_metadata, kwargs
+        if self.transport is not None and self._publisher is not None and self._codec is not None:
+            if not self.is_producer or self._active_key is None:
+                return
+            shards = self._codec.encode(layer_name, kv_layer, self._active_key)
+            self._publisher.publish(layer_name, self._active_key, shards)
+        elif self.is_producer:
             logger.debug("LayerwisePDConnector producer has no transport attached; layer=%s", layer_name)
         self._finished_layers.add(layer_name)
 
@@ -156,3 +205,4 @@ class LayerwisePDConnector(KVConnectorBase_V1):
     def shutdown(self) -> None:
         self._pending.clear()
         self._finished_layers.clear()
+        self._active_key = None
