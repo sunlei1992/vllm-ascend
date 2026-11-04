@@ -82,12 +82,15 @@ class LayerwisePDConnector(KVConnectorBase_V1):
         self._finished_layers: set[str] = set()
         self.is_producer = self.kv_role in ("kv_producer", "kv_both")
         self.is_consumer = self.kv_role in ("kv_consumer", "kv_both")
-        if role == KVConnectorRole.SCHEDULER:
-            self.transport = None
-        else:
-            # The real transport is attached by the worker after KV caches and
-            # the Mooncake store are initialized.
-            self.transport = None
+        # The real transport/runtime is attached by the worker after KV caches
+        # and the Mooncake store are initialized.  The scheduler connector
+        # only needs the request metadata.
+        self.transport: LayerwisePDTransport | None = None
+        self._publisher: LayerwisePublisher | None = None
+        self._consumer: LayerwiseConsumer | None = None
+        self._codec: LayerwisePDCodec | None = None
+        self._active_key: str | None = None
+        self._kv_caches: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # Scheduler side
@@ -154,12 +157,21 @@ class LayerwisePDConnector(KVConnectorBase_V1):
         self._publisher = LayerwisePublisher(slots=slots, transport=transport)
         self._consumer = LayerwiseConsumer(transport=transport, num_shards=num_shards)
         self._codec = codec
+        bind = getattr(codec, "bind_layer", None)
+        if callable(bind):
+            for layer_name, tensor in self._kv_caches.items():
+                bind(layer_name, tensor)
 
     def set_active_request(self, key: str) -> None:
         self._active_key = key
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         self._worker_layer_names = sorted(kv_caches)
+        self._kv_caches = dict(kv_caches)
+        bind = getattr(self._codec, "bind_layer", None)
+        if callable(bind):
+            for layer_name, tensor in self._kv_caches.items():
+                bind(layer_name, tensor)
 
     def start_load_kv(self, forward_context: ForwardContext, **kwargs: Any) -> None:
         del forward_context, kwargs

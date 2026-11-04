@@ -5,11 +5,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_pd import (
     InMemoryTCPTransport,
     LayerwisePublisher,
+)
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_pd_codec import (
+    CPUByteCodec,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_pd_connector import (
     LayerwisePDConnector,
@@ -148,3 +152,33 @@ def test_attach_runtime_rejects_scheduler_role() -> None:
             num_shards=1,
             codec=FakeCodec(),
         )
+
+
+def test_connector_tensor_roundtrip_through_publisher_and_consumer() -> None:
+    transport = InMemoryTCPTransport()
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    target = torch.zeros_like(source)
+
+    producer = make_connector(KVConnectorRole.WORKER, "kv_producer")
+    producer.attach_layerwise_runtime(
+        transport=transport,
+        slots=(("layer0",),),
+        num_shards=2,
+        codec=CPUByteCodec(num_shards=2),
+    )
+    producer.register_kv_caches({"layer0": source})
+    producer.set_active_request("req-tensor")
+    producer.save_kv_layer("layer0", source, attn_metadata=None)
+
+    consumer = make_connector(KVConnectorRole.WORKER, "kv_consumer")
+    consumer.attach_layerwise_runtime(
+        transport=transport,
+        slots=(("layer0",),),
+        num_shards=2,
+        codec=CPUByteCodec(num_shards=2),
+    )
+    consumer.register_kv_caches({"layer0": target})
+    consumer.set_active_request("req-tensor")
+    consumer.wait_for_layer_load("layer0")
+
+    assert torch.equal(target, source)
