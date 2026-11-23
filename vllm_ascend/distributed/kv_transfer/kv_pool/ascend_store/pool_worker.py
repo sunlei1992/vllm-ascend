@@ -3296,22 +3296,16 @@ class KVPoolWorker:
                 waited_s += 1
                 if waited_s % 60 == 0:
                     logger.info("Layerwise save drain still waiting on %d queued PUT(s)", queue.unfinished_tasks)
-        while not save_finished_events[num_local - 1].wait(timeout=10):
-            send_thread.raise_if_failed()
-            logger.info("Layerwise %d save not done, keep waiting", num_local - 1)
         send_thread.raise_if_failed()
         if self.block_key_hybrid:
             # An empty final layer signals completion without waiting for PUTs
             # from earlier layers. Drain those before the next step reuses KV.
             self._drain_attention_transfers(drain_recv=False, full=True)
-        elif self.use_block_key_layerwise:
-            # An empty final layer sets its event on the compute thread, ahead
-            # of earlier queued PUTs. Drain at the step boundary before source
-            # blocks can be reused. Layer-to-layer overlap remains unchanged.
-            for layer_id in range(num_local - 1):
-                while not save_finished_events[layer_id].wait(timeout=10):
-                    send_thread.raise_if_failed()
-            send_thread.raise_if_failed()
+        # The request-queue drain above already guarantees that every queued
+        # PUT finished. Per-layer save events are one-shot signals that a reuse
+        # load consumes (wait + clear) when it takes over the same slot, so
+        # waiting on them here can block forever. Do not block on them; only
+        # reset the events that no reuse consumer is expected to consume.
         reuse_source_layers = set(self.prefetch_layer_map.values())
         for layer_id in range(num_local):
             if layer_id in reuse_source_layers:
