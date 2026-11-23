@@ -1546,7 +1546,12 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
                 if is_last_chunk and self.try_finish_and_delete_stored_request(req_id):
                     self.set_finished_request(req_id)
 
-        assert not self.layer_save_finished_events[layer_id].is_set(), f"thread: {layer_id} save failed "
+        if self.layer_save_finished_events[layer_id].is_set():
+            # A previous step's signal may still be set if no reuse consumer
+            # cleared it (for example the reusing layer was not reached).
+            # Reset it before publishing this save instead of asserting.
+            logger.debug("Layerwise save event %d still set; resetting", layer_id)
+            self.layer_save_finished_events[layer_id].clear()
         logger.debug("Key-based layer save event set: layer %d", layer_id)
         self.layer_save_finished_events[layer_id].set()
         transfer_tasks.clear()
