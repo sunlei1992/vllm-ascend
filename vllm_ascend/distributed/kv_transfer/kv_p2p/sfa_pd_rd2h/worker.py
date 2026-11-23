@@ -56,10 +56,14 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     get_sparse_kv_offload_manager,
 )
 from vllm_ascend.distributed.kv_transfer.utils.memfabric_transfer_engine import (
-    BACKEND_MEMFABRIC,
     MEMFABRIC_ROLE_DECODE,
     MEMFABRIC_ROLE_PREFILL,
-    global_memfabric_te,
+)
+from vllm_ascend.distributed.kv_transfer.utils.pull_engine import (
+    BACKEND_MEMFABRIC,
+    PULL_BACKENDS,
+    make_pull_engine,
+    resolve_transfer_backend,
 )
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     collect_storage_merged_register_regions,
@@ -95,8 +99,7 @@ def _resolve_kv_transfer_backend(vllm_config: VllmConfig) -> str:
     Read from ``kv_connector_extra_config["transfer_backend"]``, defaulting
     to ``"memfabric"``, the only supported backend.
     """
-    extra = vllm_config.kv_transfer_config.kv_connector_extra_config or {}
-    return extra.get("transfer_backend", BACKEND_MEMFABRIC)
+    return resolve_transfer_backend(vllm_config)
 
 
 def _resolve_memfabric_transfer_protocol(vllm_config: VllmConfig) -> str | None:
@@ -205,17 +208,13 @@ class SFAPDRD2HConsumerWorker:
     # ------------------------------------------------------------------
     def _ensure_engine(self):
         if self.engine is None:
-            backend = _resolve_kv_transfer_backend(self.vllm_config)
-            if backend != BACKEND_MEMFABRIC:
-                raise RuntimeError(
-                    "SfaRemoteD2HConnector D side supports MemFabric pull only (set transfer_backend=memfabric)."
-                )
-            global_memfabric_te.configure(
+            self.engine = make_pull_engine(
+                self.vllm_config,
                 role=MEMFABRIC_ROLE_DECODE,
+                hostname=self.side_channel_host,
                 device_id=torch.npu.current_device(),
-                transfer_protocol=_resolve_memfabric_transfer_protocol(self.vllm_config),
+                memfabric_protocol=_resolve_memfabric_transfer_protocol(self.vllm_config),
             )
-            self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
         return self.engine
 
     # ------------------------------------------------------------------
@@ -224,9 +223,7 @@ class SFAPDRD2HConsumerWorker:
     # ------------------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Bind MemFabric destinations owned by SparseKVOffloadManager."""
-        assert _resolve_kv_transfer_backend(self.vllm_config) == BACKEND_MEMFABRIC, (
-            "SfaRemoteD2HConnector D side supports memfabric pull only (set transfer_backend=memfabric)."
-        )
+        assert _resolve_kv_transfer_backend(self.vllm_config) in PULL_BACKENDS
         self.offload_manager = get_sparse_kv_offload_manager()
         if not hasattr(self.offload_manager, "offload_layer_names"):
             raise RuntimeError(
@@ -608,15 +605,6 @@ class SFAPDRD2HProducerWorker:
         # memfabric engine reads this during construction.
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         self._backend = _resolve_kv_transfer_backend(vllm_config)
-        if self._backend != BACKEND_MEMFABRIC:
-            raise RuntimeError(
-                "SfaRemoteD2HConnector P side supports MemFabric pull only (set transfer_backend=memfabric)."
-            )
-        global_memfabric_te.configure(
-            role=MEMFABRIC_ROLE_PREFILL,
-            device_id=torch.npu.current_device(),
-            transfer_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
-        )
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
         self.engine_id = engine_id
@@ -629,7 +617,13 @@ class SFAPDRD2HProducerWorker:
         self.side_channel_port = vllm_config.kv_transfer_config.kv_port + self.dp_rank * self.tp_size
         self.total_layers = vllm_config.model_config.get_num_layers(vllm_config.parallel_config)
         self.last_layer_idx = self.total_layers - 1
-        self.engine = global_memfabric_te.get_transfer_engine(self.side_channel_host)
+        self.engine = make_pull_engine(
+            vllm_config,
+            role=MEMFABRIC_ROLE_PREFILL,
+            hostname=self.side_channel_host,
+            device_id=torch.npu.current_device(),
+            memfabric_protocol=_resolve_memfabric_transfer_protocol(vllm_config),
+        )
         self.te_rpc_port = self.engine.get_rpc_port()
         self.kv_cache_specs = [group_spec.kv_cache_spec for group_spec in self.kv_cache_config.kv_cache_groups]
         self.block_size = [spec.block_size for spec in self.kv_cache_specs]
@@ -670,7 +664,7 @@ class SFAPDRD2HProducerWorker:
         (P is not pushing to D — D reads from P). Skip GET_META entirely
         to avoid flooding D's ROUTER with 61 unnecessary requests that
         delay MF_META / READ_READY_BATCH."""
-        if self._backend == BACKEND_MEMFABRIC:
+        if self._backend in PULL_BACKENDS:
             return req_meta
         raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
 
@@ -686,7 +680,7 @@ class SFAPDRD2HProducerWorker:
 
         ``remote_host`` / ``local_block_ids`` are already correct from
         ``build_connector_meta``; main and indexer group ids remain separate."""
-        if self._backend == BACKEND_MEMFABRIC:
+        if self._backend in PULL_BACKENDS:
             self.current_layer = 0
             self._pd_dispatched_layers = set()
             self._active_dspark_requests = {}
@@ -759,7 +753,7 @@ class SFAPDRD2HProducerWorker:
         return ProducerSendState(
             last_layer_idx=self.last_layer_idx,
             layer_metadata=self.layer_metadata,
-            p_session=global_memfabric_te.unique_id,
+            p_session=self.engine.unique_id,
             main_group_idx=self.main_group_idx,
             indexer_group_idx=self.indexer_group_idx,
             block_sizes=tuple(self.block_size),
@@ -789,7 +783,7 @@ class SFAPDRD2HProducerWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         # memfabric pull mode only.
-        assert self._backend == BACKEND_MEMFABRIC, "SfaRemoteD2HConnector P side supports memfabric pull only."
+        assert self._backend in PULL_BACKENDS
         layer2group_ids: dict[str, int] = {}
         for group_idx, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             for layer_name in kv_cache_group.layer_names:
@@ -853,7 +847,9 @@ class SFAPDRD2HProducerWorker:
         # so draft layer indices cannot collide with target SFA layer indices.
         register_regions = collect_storage_merged_register_regions(kv_caches)
         validate_register_region_count(register_regions)
-        global_memfabric_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+        rc = self.engine.register_memory(register_regions.ptrs, register_regions.lengths)
+        if rc != 0:
+            raise RuntimeError(f"Pull engine register_memory failed rc={rc}")
 
         ready_event = threading.Event()
         send_state = self._build_producer_send_state()
@@ -873,7 +869,7 @@ class SFAPDRD2HProducerWorker:
             "MembPull P registered kv caches: target_layers=%d, dspark_draft_layers=%d, p_session=%s",
             len(self.layer_metadata),
             len(self.dspark_draft_kv_metadata),
-            global_memfabric_te.unique_id,
+            self.engine.unique_id,
         )
 
     def configure_dspark_draft_layers(self, layer_names: tuple[str, ...]) -> None:
@@ -996,7 +992,7 @@ class SFAPDRD2HProducerWorker:
         D-notification is moved earlier so co-located pull overlaps attention.
         Idempotent per layer — save_kv_layer skips layers dispatched here.
         """
-        if self._backend != BACKEND_MEMFABRIC or self.kv_send_layer_thread is None:
+        if self._backend not in PULL_BACKENDS or self.kv_send_layer_thread is None:
             return
         resolved_layer_name = layer_name or (
             self.stage_layer_names[self.current_layer] if self.current_layer < len(self.stage_layer_names) else None
@@ -1025,7 +1021,7 @@ class SFAPDRD2HProducerWorker:
         connector_metadata: KVConnectorMetadata,
         **kwargs,
     ) -> None:
-        if self._backend != BACKEND_MEMFABRIC:
+        if self._backend not in PULL_BACKENDS:
             raise RuntimeError("SfaRemoteD2HConnector P side supports memfabric pull only.")
         send_thread = self.kv_send_layer_thread
         if send_thread is None:
